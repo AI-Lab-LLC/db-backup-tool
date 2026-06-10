@@ -1,0 +1,1 @@
+- [UI Structure: Layout, Breeze, backups/index](project-ui-structure.md) — layout x-app-layout, Alpine tbody x-data паттерн для restore, роуты и переменные вьюхи

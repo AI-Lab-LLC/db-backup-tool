@@ -1,0 +1,47 @@
+# VCS / editor
+.git
+.gitignore
+.gitattributes
+.editorconfig
+.idea
+.vscode
+.zed
+
+# Dependencies (reinstalled inside the image)
+/vendor
+/node_modules
+
+# Build artifacts (rebuilt inside the image)
+/public/build
+/public/hot
+/public/storage
+
+# Local env & secrets (compose injects env explicitly)
+.env
+.env.*
+!.env.docker
+
+# Laravel runtime / caches
+/storage/*.key
+/storage/logs/*
+/storage/framework/cache/*
+/storage/framework/sessions/*
+/storage/framework/views/*
+/storage/app/tmp
+/.phpunit.cache
+.phpunit.result.cache
+
+# Tooling / docs not needed at runtime
+/tests
+/.codegraph
+/.claude
+README.md
+checklist.md
+backup_panel_spec_for_claude_cli.md
+auth.json
+_ide_helper.php
+
+# Docker meta
+Dockerfile
+docker-compose.yml
+.dockerignore

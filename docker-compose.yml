@@ -1,0 +1,177 @@
+name: backup-panel
+
+# This compose file runs ONLY the Backup Panel application (web + queue + scheduler).
+# It does NOT define PostgreSQL or MinIO — those already run in ~/workspace/infra
+# (project name "workspace-infra") and are reached over the shared external
+# docker network "workspace-net" by their service names:
+#   - postgres  (container ws-postgres, image postgres:17)  -> DB host
+#   - minio     (container ws-minio,    image minio/minio)  -> S3 endpoint :9000
+#
+# Credentials below are the infra DEFAULTS (no infra/.env present, so compose
+# defaults apply): postgres workspace/secret, minio minioadmin/minioadmin.
+# Override via the project .env if infra is reconfigured.
+
+x-app-env: &app-env
+  # --- Laravel core ---
+  APP_NAME: "Backup Panel"
+  APP_ENV: "${APP_ENV:-production}"
+  APP_DEBUG: "${APP_DEBUG:-false}"
+  APP_KEY: "${APP_KEY:-}"
+  APP_URL: "${APP_URL:-http://localhost:8000}"
+  LOG_CHANNEL: stack
+  LOG_LEVEL: "${LOG_LEVEL:-info}"
+
+  # --- Panel's OWN database (Laravel tables) — lives inside infra postgres ---
+  # We point to the infra `postgres` service by name, on the dedicated
+  # `backup_panel` database created by the db-init service below.
+  DB_CONNECTION: pgsql
+  DB_HOST: postgres
+  DB_PORT: 5432
+  DB_DATABASE: "${DB_DATABASE:-backup_panel}"
+  DB_USERNAME: "${POSTGRES_USER:-workspace}"
+  DB_PASSWORD: "${POSTGRES_PASSWORD:-secret}"
+
+  # --- PostgreSQL target for pg_dump / pg_restore / psql (same infra server) ---
+  # In production these point at 10.0.0.3; in this dockerized dev setup the
+  # target IS the infra postgres reachable as `postgres` on workspace-net.
+  # PGPASSWORD itself is set by BackupService via process env (never argv).
+  PG_HOST: postgres
+  PG_PORT: 5432
+  PG_USER: "${POSTGRES_USER:-workspace}"
+  PG_PASSWORD: "${POSTGRES_PASSWORD:-secret}"
+
+  # --- Queue / session / cache (database driver, per spec) ---
+  QUEUE_CONNECTION: database
+  SESSION_DRIVER: database
+  CACHE_STORE: database
+
+  # --- S3 (MinIO from infra), path-style required by MinIO ---
+  FILESYSTEM_DISK: s3
+  AWS_ACCESS_KEY_ID: "${MINIO_ROOT_USER:-minioadmin}"
+  AWS_SECRET_ACCESS_KEY: "${MINIO_ROOT_PASSWORD:-minioadmin}"
+  AWS_DEFAULT_REGION: "${AWS_DEFAULT_REGION:-us-east-1}"
+  AWS_BUCKET: "${AWS_BUCKET:-postgres-backups}"
+  AWS_ENDPOINT: "http://minio:9000"
+  AWS_USE_PATH_STYLE_ENDPOINT: "true"
+  # BackupService storage knobs (config/backup.php). Defaults already match,
+  # set explicitly so the dump key prefix stays postgres-backups/{db}/...
+  BACKUP_DISK: s3
+  BACKUP_PREFIX: postgres-backups
+  BACKUP_DOWNLOAD_URL_TTL: "15"
+
+  # --- Seeded admin account (AdminUserSeeder) ---
+  ADMIN_EMAIL: "${ADMIN_EMAIL:-admin@example.com}"
+  ADMIN_PASSWORD: "${ADMIN_PASSWORD:-change-me-please}"
+
+services:
+  # ---------------------------------------------------------------------------
+  # One-shot: create the panel's database inside the infra postgres.
+  # The infra db init script only runs on first container start (volume was
+  # already initialized), so we create `backup_panel` idempotently here.
+  # ---------------------------------------------------------------------------
+  db-init:
+    image: postgres:17
+    networks: [workspace-net]
+    environment:
+      PGPASSWORD: "${POSTGRES_PASSWORD:-secret}"
+    entrypoint: ["bash", "-c"]
+    command:
+      - >
+        until pg_isready -h postgres -U "${POSTGRES_USER:-workspace}"; do sleep 2; done;
+        psql -h postgres -U "${POSTGRES_USER:-workspace}" -d postgres -tc
+        "SELECT 1 FROM pg_database WHERE datname='${DB_DATABASE:-backup_panel}'"
+        | grep -q 1 ||
+        psql -h postgres -U "${POSTGRES_USER:-workspace}" -d postgres -c
+        "CREATE DATABASE ${DB_DATABASE:-backup_panel}";
+        echo "db-init done";
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # One-shot: ensure the S3 bucket exists in the infra MinIO.
+  # Key layout used by the panel: postgres-backups/{db}/{db}_{timestamp}.dump
+  # ---------------------------------------------------------------------------
+  s3-init:
+    image: minio/mc:latest
+    networks: [workspace-net]
+    entrypoint: ["sh", "-c"]
+    command:
+      - >
+        until mc alias set infra http://minio:9000 "${MINIO_ROOT_USER:-minioadmin}" "${MINIO_ROOT_PASSWORD:-minioadmin}"; do sleep 2; done;
+        mc mb --ignore-existing "infra/${AWS_BUCKET:-postgres-backups}";
+        echo "s3-init done";
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # Web (HTTP) — php artisan serve. Runs migrations + seeders via entrypoint.
+  # ---------------------------------------------------------------------------
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: backup-panel:latest
+    container_name: backup-panel-web
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+      CONTAINER_ROLE: web
+    depends_on:
+      - db-init
+      - s3-init
+    ports:
+      # Bind to loopback only — internal tool, never publish publicly (spec).
+      - "127.0.0.1:${WEB_PORT:-8000}:8000"
+    volumes:
+      # Persist temp dumps + logs across restarts (storage/app/tmp used by backup()).
+      - app-storage:/var/www/html/storage
+    networks: [workspace-net]
+    # Optional: expose via the infra traefik (uncomment if desired)
+    # labels:
+    #   - "traefik.enable=true"
+    #   - "traefik.http.routers.backup-panel.rule=Host(`backup.test`)"
+    #   - "traefik.http.services.backup-panel.loadbalancer.server.port=8000"
+
+  # ---------------------------------------------------------------------------
+  # Queue worker — runs RunBackupJob (timeout ~3700s, per invariants).
+  # ---------------------------------------------------------------------------
+  queue:
+    image: backup-panel:latest
+    container_name: backup-panel-queue
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+      CONTAINER_ROLE: queue
+    command: ["php", "artisan", "queue:work", "--timeout=3700", "--tries=2", "--sleep=3"]
+    depends_on:
+      - web
+    volumes:
+      - app-storage:/var/www/html/storage
+    networks: [workspace-net]
+
+  # ---------------------------------------------------------------------------
+  # Scheduler — emulates cron `schedule:run` every minute (Laravel >=11
+  # `schedule:work` loops internally and dispatches per the kernel schedule,
+  # which registers backups:dispatch ->everyMinute()).
+  # ---------------------------------------------------------------------------
+  scheduler:
+    image: backup-panel:latest
+    container_name: backup-panel-scheduler
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+      CONTAINER_ROLE: scheduler
+    command: ["php", "artisan", "schedule:work"]
+    depends_on:
+      - web
+    volumes:
+      - app-storage:/var/www/html/storage
+    networks: [workspace-net]
+
+volumes:
+  app-storage:
+
+# Attach to the EXISTING infra network (created by workspace-infra compose).
+# external: true means compose will NOT create it and errors if absent.
+networks:
+  workspace-net:
+    external: true
+    name: workspace-net

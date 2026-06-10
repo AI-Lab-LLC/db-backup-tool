@@ -1,0 +1,37 @@
+# editor / vim swap files
+*.sw?
+*~
+*.bak
+
+# secrets & local env
+.env
+.env.*
+!.env.example
+
+# Laravel (present once the app is scaffolded)
+*.log
+.DS_Store
+Thumbs.db
+/vendor
+/node_modules
+/public/build
+/public/hot
+/public/storage
+/storage/*.key
+/storage/pail
+/storage/app/tmp
+/.phpunit.cache
+.phpunit.result.cache
+/auth.json
+_ide_helper.php
+
+# IDE / editor
+/.idea
+/.vscode
+/.zed
+/.nova
+/.fleet
+.phpactor.json
+
+# CodeGraph index (local, rebuildable)
+.codegraph/
