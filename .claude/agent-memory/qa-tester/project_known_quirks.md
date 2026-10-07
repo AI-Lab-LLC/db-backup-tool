@@ -1,14 +1,16 @@
 ---
 name: project-known-quirks
-description: Known false-positive test failure and seeder env() caveat in backup_panel
+description: Recurring review pitfalls in backup_panel — prune data-loss class, array cache in tests hides lock behaviour
 metadata:
   type: project
 ---
 
-Backup Panel known quirks (verified 2026-06-05, Z11 QA):
+Backup Panel review notes (updated 2026-10-07):
 
-- **Stock `tests/Feature/ExampleTest.php` always FAILS** — it asserts `GET /` returns 200, but `/` redirects guests to /login (302) per spec §8b. This is the default Breeze test, not a product bug. The full suite shows "37 passed, 1 failed" because of this. Don't treat it as a regression; flag it for cleanup (rewrite as assertRedirect(route('login')) or delete).
-- **`AdminUserSeeder` reads `env('ADMIN_EMAIL')` / `env('ADMIN_PASSWORD')` directly** — under `config:cache` `env()` outside config files returns null, so the seeder would skip. README instructs seeding before caching, so LOW severity. Don't re-file as a fresh bug each cycle.
+- Old quirks (ExampleTest failing, AdminUserSeeder env()) are resolved: full suite was 89/89 green on 2026-10-07 and seeder reads `config('backup.admin')`.
+- **Retention is a data-loss hotspot.** Spec §9 ties pruning to a fresh success. Any prune path that runs independently of a fresh success (e.g. a daily `backups:prune` command) can wipe the last valid dump of a failing/disabled/manual-only DB. Always check "newest success is never pruned".
+- **Tests use `CACHE_STORE=array`, `QUEUE_CONNECTION=sync`.** ShouldBeUnique locks and schedule `withoutOverlapping` mutexes on the prod `database` cache store aren't exercised; reason about them from vendor code (Laravel 13: CallQueuedHandler releases unique lock on success and on final failed()).
+- The history view shows "Delete" for every status, including `running`. Watch for in-flight-row deletion.
 
-**Why:** these two recur every QA pass and look like failures but are known/accepted.
-**How to apply:** when triaging, subtract these from any FAIL count before deciding the build is broken.
+**Why:** these came up as real bugs in the 2026-10-07 reliability review.
+**How to apply:** check them first when reviewing backup/prune/delete changes.

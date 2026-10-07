@@ -9,7 +9,6 @@ use App\Services\BackupService;
 use Carbon\Carbon;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Storage;
 use Illuminate\View\View;
 use Throwable;
 
@@ -145,7 +144,16 @@ class BackupController extends Controller
             return back()->withErrors(['database' => "Неизвестная база «{$database}»."]);
         }
 
-        RunBackupJob::dispatch($database, 'manual');
+        // ShouldBeUnique would silently drop a duplicate dispatch, so check for
+        // an in-flight row and take the unique lock explicitly to report honestly.
+        $inFlight = Backup::query()
+            ->where('database_name', $database)
+            ->where('status', 'running')
+            ->exists();
+
+        if ($inFlight || ! RunBackupJob::dispatchIfIdle($database, 'manual')) {
+            return back()->with('error', "Бэкап «{$database}» уже выполняется или стоит в очереди.");
+        }
 
         return back()->with('status', "Бэкап базы «{$database}» поставлен в очередь.");
     }
@@ -183,17 +191,19 @@ class BackupController extends Controller
     }
 
     /**
-     * Delete a backup from S3 and remove its history record. No processes are
-     * touched — this is a plain storage/record delete, so it stays in the
-     * controller without breaking layer decoupling.
+     * Delete a backup from S3 and remove its history record — via the service,
+     * which only drops the row once the S3 object is confirmed gone and never
+     * deletes an object another row still references.
      */
-    public function destroy(Backup $backup): RedirectResponse
+    public function destroy(Backup $backup, BackupService $service): RedirectResponse
     {
-        if ($backup->s3_path) {
-            Storage::disk(config('backup.disk', 's3'))->delete($backup->s3_path);
+        if ($backup->status === 'running') {
+            return back()->with('error', 'Нельзя удалить бэкап, который ещё выполняется.');
         }
 
-        $backup->delete();
+        if (! $service->deleteBackup($backup)) {
+            return back()->with('error', "Не удалось удалить файл бэкапа из S3 ({$backup->s3_path}); запись сохранена, попробуйте ещё раз.");
+        }
 
         return back()->with('status', 'Бэкап удалён.');
     }

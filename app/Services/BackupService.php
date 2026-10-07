@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use App\Models\Backup;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 use RuntimeException;
 use Symfony\Component\Process\Process;
@@ -13,6 +14,14 @@ class BackupService
      * Max wall-clock time (seconds) for any pg_* / psql process.
      */
     private const PROCESS_TIMEOUT = 3600;
+
+    /**
+     * A 'running' row older than this (minutes) is considered dead. Must stay
+     * above RunBackupJob::$timeout (3700s).
+     */
+    public const STALE_RUNNING_MINUTES = 120;
+
+    public const STALE_RUNNING_ERROR = 'stale: worker died / timed out';
 
     /**
      * Discover every connectable, non-template database on the PostgreSQL server.
@@ -54,11 +63,14 @@ class BackupService
      * Dump a database (custom format) and upload it to S3.
      *
      * Creates a Backup history row (status=running), runs `pg_dump -Fc` into a
-     * temp file under storage/app/tmp, uploads it to
-     * postgres-backups/{db}/{db}_{timestamp}.dump, then marks the row success.
+     * unique temp file under config('backup.tmp_dir'), uploads it to
+     * postgres-backups/{db}/{db}_{timestamp}.dump, verifies the uploaded object
+     * size matches the local dump, then marks the row success.
      *
-     * On a non-zero exit or FATAL stderr the row is marked failed. The temp file
-     * is always removed in a finally block.
+     * The row is marked failed on: a non-zero exit / FATAL stderr, a missing or
+     * empty dump file, put() returning false (the s3 disk has 'throw' => false),
+     * or a remote/local size mismatch. A partially uploaded object is deleted on
+     * a best-effort basis. The temp file is always removed in a finally block.
      *
      * NOTE: this method intentionally does NOT touch BackupConfig::last_run_at and
      * does NOT call pruneOld() — that is RunBackupJob's responsibility (layer
@@ -79,13 +91,26 @@ class BackupService
             'started_at' => now(),
         ]);
 
-        $tmpDir = storage_path('app/tmp');
-        if (! is_dir($tmpDir)) {
-            @mkdir($tmpDir, 0775, true);
+        // Same-second S3 key collision guard. RunBackupJob is ShouldBeUnique per
+        // database, so this should never trigger; if it does, the older row owns
+        // the key and this one fails WITHOUT a key (s3_path '') so that neither
+        // its cleanup nor a later prune can delete the other row's object.
+        $collides = Backup::query()
+            ->where('s3_path', $s3Path)
+            ->where('id', '<', $backup->id)
+            ->exists();
+
+        if ($collides) {
+            return $this->markFailed($backup, "S3 key collision: {$s3Path} is already used by another backup started in the same second", ['s3_path' => '']);
         }
-        $tmpFile = $tmpDir . DIRECTORY_SEPARATOR . $filename;
+
+        // Unique per row, so concurrent runs can never share a temp file.
+        $tmpFile = null;
+        $uploadAttempted = false;
 
         try {
+            $tmpFile = $this->tmpDir() . DIRECTORY_SEPARATOR . "backup_{$backup->id}_{$filename}";
+
             $process = $this->makeProcess([
                 'pg_dump',
                 '-Fc',                 // custom (compressed) archive format
@@ -99,30 +124,54 @@ class BackupService
             $stderr = trim($process->getErrorOutput());
 
             if (! $process->isSuccessful() || $this->hasFatal($stderr)) {
-                $message = $stderr !== '' ? $stderr : 'pg_dump exited with a non-zero status';
+                return $this->markFailed($backup, $stderr !== '' ? $stderr : 'pg_dump exited with a non-zero status');
+            }
 
-                $backup->update([
-                    'status' => 'failed',
-                    'error' => $message,
-                    'finished_at' => now(),
-                ]);
+            clearstatcache(true, $tmpFile);
+            $localSize = is_file($tmpFile) ? (int) filesize($tmpFile) : 0;
 
-                return $backup;
+            if ($localSize <= 0) {
+                return $this->markFailed($backup, 'pg_dump reported success but the dump file is missing or empty');
             }
 
             // Stream the dump to S3 (avoids loading the whole file into memory).
             $stream = fopen($tmpFile, 'rb');
+            if ($stream === false) {
+                return $this->markFailed($backup, "Could not open dump file for upload: {$tmpFile}");
+            }
+
+            $uploadAttempted = true;
 
             try {
-                $this->disk()->put($s3Path, $stream);
+                $uploaded = $this->disk()->put($s3Path, $stream);
             } finally {
                 if (is_resource($stream)) {
                     fclose($stream);
                 }
             }
 
+            if ($uploaded === false) {
+                $this->deleteObjectQuietly($s3Path);
+
+                return $this->markFailed($backup, "S3 upload failed: put() returned false for {$s3Path}");
+            }
+
+            try {
+                $remoteSize = $this->disk()->size($s3Path);
+            } catch (\Throwable $e) {
+                $remoteSize = null;
+            }
+
+            if (! is_int($remoteSize) || $remoteSize !== $localSize) {
+                $this->deleteObjectQuietly($s3Path);
+
+                $remote = is_int($remoteSize) ? "{$remoteSize} bytes" : 'unavailable';
+
+                return $this->markFailed($backup, "S3 upload verification failed for {$s3Path}: local {$localSize} bytes, remote {$remote}");
+            }
+
             $backup->update([
-                'size_bytes' => @filesize($tmpFile) ?: null,
+                'size_bytes' => $localSize,
                 's3_path' => $s3Path,
                 'filename' => $filename,
                 'status' => 'success',
@@ -131,15 +180,13 @@ class BackupService
 
             return $backup;
         } catch (\Throwable $e) {
-            $backup->update([
-                'status' => 'failed',
-                'error' => $e->getMessage(),
-                'finished_at' => now(),
-            ]);
+            if ($uploadAttempted) {
+                $this->deleteObjectQuietly($s3Path);
+            }
 
-            return $backup;
+            return $this->markFailed($backup, $e->getMessage());
         } finally {
-            if (is_file($tmpFile)) {
+            if ($tmpFile !== null && is_file($tmpFile)) {
                 @unlink($tmpFile);
             }
         }
@@ -173,19 +220,16 @@ class BackupService
             throw new RuntimeException("Invalid target database name: {$targetDatabase}");
         }
 
-        $tmpDir = storage_path('app/tmp');
-        if (! is_dir($tmpDir)) {
-            @mkdir($tmpDir, 0775, true);
-        }
-        $tmpFile = $tmpDir . DIRECTORY_SEPARATOR . 'restore_' . $backup->id . '_' . basename($backup->filename);
+        $tmpFile = $this->tmpDir() . DIRECTORY_SEPARATOR . 'restore_' . $backup->id . '_' . basename($backup->filename);
 
         try {
-            // Pull the dump down from S3.
-            $contents = $this->disk()->get($backup->s3_path);
-            if ($contents === null) {
-                throw new RuntimeException("Dump not found on S3: {$backup->s3_path}");
-            }
-            file_put_contents($tmpFile, $contents);
+            // Stream the dump down from S3 (never buffer the whole file in memory).
+            $this->downloadToFile($backup->s3_path, $tmpFile);
+
+            // A dropped connection yields a short (not failed) copy, and
+            // pg_restore on a truncated archive errors without "FATAL" — so
+            // verify completeness BEFORE the destructive --clean runs.
+            $this->assertDownloadComplete($backup, $tmpFile);
 
             $process = $this->makeProcess([
                 'pg_restore',
@@ -213,30 +257,100 @@ class BackupService
     }
 
     /**
-     * Delete successful backups for a database older than the retention window,
-     * removing both the S3 object and the history row.
+     * Delete backups for a database older than the retention window (any status:
+     * success, failed, or long-dead running rows), removing the S3 object and the
+     * history row.
+     *
+     * A row is deleted ONLY when its S3 object is confirmed gone: delete()
+     * returned true, the object no longer exists, or the row has no s3_path. On
+     * failure the row is kept (so the object stays visible/retryable) and a
+     * warning is logged. An object still referenced by a surviving row (e.g. a
+     * shared key) is never deleted — only the stale row is dropped.
+     *
+     * The newest success row for the database (and its object) is ALWAYS kept.
      *
      * A non-positive retention means "keep everything" — nothing is deleted.
+     *
+     * @return array{deleted: int, kept: int}
      */
-    public function pruneOld(string $database, int $retentionDays): void
+    public function pruneOld(string $database, int $retentionDays): array
     {
+        $summary = ['deleted' => 0, 'kept' => 0];
+
         if ($retentionDays <= 0) {
-            return;
+            return $summary;
         }
 
         $cutoff = now()->subDays($retentionDays);
 
-        Backup::query()
+        // Never prune the newest successful backup, however old: if backups
+        // have been failing (or the DB is disabled / manual-only) longer than
+        // the retention window, it is the only restorable dump left.
+        $newestSuccessId = Backup::query()
             ->where('database_name', $database)
             ->where('status', 'success')
+            ->max('id');
+
+        $expired = Backup::query()
+            ->where('database_name', $database)
             ->where('created_at', '<', $cutoff)
-            ->get()
-            ->each(function (Backup $backup) {
-                if ($backup->s3_path) {
-                    $this->disk()->delete($backup->s3_path);
-                }
-                $backup->delete();
-            });
+            ->when($newestSuccessId !== null, fn ($q) => $q->where('id', '!=', $newestSuccessId))
+            ->orderBy('id')
+            ->get();
+
+        foreach ($expired as $backup) {
+            // Objects still referenced by a row that survives this prune (any
+            // success row, or anything inside the window) are never deleted.
+            $removed = $this->removeBackup($backup, fn ($q) => $q
+                ->where('status', 'success')
+                ->orWhere('created_at', '>=', $cutoff));
+
+            $removed ? $summary['deleted']++ : $summary['kept']++;
+        }
+
+        return $summary;
+    }
+
+    /**
+     * Delete a single backup (UI "delete"): S3 object first, history row only
+     * once the object is confirmed gone. An object that any other row still
+     * references is left in place and only this row is removed.
+     *
+     * @return bool true if the row was deleted, false if the row is still
+     *              'running' or the S3 delete failed (the row is kept)
+     */
+    public function deleteBackup(Backup $backup): bool
+    {
+        // An in-flight backup will still upload its object; deleting the row
+        // now would orphan that object (prune only iterates rows).
+        if ($backup->status === 'running') {
+            return false;
+        }
+
+        return $this->removeBackup($backup, fn ($q) => $q);
+    }
+
+    /**
+     * Mark rows stuck in 'running' longer than STALE_RUNNING_MINUTES as failed.
+     *
+     * The threshold (2h) is well above RunBackupJob's timeout (3700s), so such a
+     * row can only belong to a worker that died or was killed.
+     *
+     * @return int number of rows marked failed
+     */
+    public function markStaleRunning(): int
+    {
+        $threshold = now()->subMinutes(self::STALE_RUNNING_MINUTES);
+
+        return Backup::query()
+            ->where('status', 'running')
+            ->where(fn ($q) => $q->where('started_at', '<', $threshold)
+                ->orWhere(fn ($q) => $q->whereNull('started_at')->where('created_at', '<', $threshold)))
+            ->update([
+                'status' => 'failed',
+                'error' => self::STALE_RUNNING_ERROR,
+                'finished_at' => now(),
+            ]);
     }
 
     /**
@@ -261,9 +375,12 @@ class BackupService
      * environment only. Using the array form guarantees the password can never be
      * exposed in `ps` / argv.
      *
+     * Protected only so tests can substitute a harmless process (pg_* binaries
+     * are not available locally); production code must never bypass it.
+     *
      * @param string[] $command
      */
-    private function makeProcess(array $command): Process
+    protected function makeProcess(array $command): Process
     {
         $process = new Process(
             $command,
@@ -300,6 +417,172 @@ class BackupService
     private function isValidDatabaseName(string $name): bool
     {
         return $name !== '' && preg_match('/^[A-Za-z0-9_]+$/', $name) === 1;
+    }
+
+    /**
+     * Shared delete logic for pruneOld() / deleteBackup().
+     *
+     * The S3 object is deleted unless another row matching $survivors still
+     * references the same s3_path. The row is deleted only when the object is
+     * confirmed gone (or not ours to delete); otherwise a warning is logged and
+     * the row is kept.
+     *
+     * @param callable(\Illuminate\Database\Eloquent\Builder): mixed $survivors
+     */
+    private function removeBackup(Backup $backup, callable $survivors): bool
+    {
+        $path = (string) $backup->s3_path;
+
+        $shared = $path !== '' && Backup::query()
+            ->where('s3_path', $path)
+            ->where('id', '!=', $backup->id)
+            ->where(fn ($q) => $survivors($q))
+            ->exists();
+
+        if ($path !== '' && ! $shared && ! $this->deleteObject($path)) {
+            Log::warning('Backup delete: S3 delete failed, keeping history row', [
+                'backup_id' => $backup->id,
+                'database' => $backup->database_name,
+                's3_path' => $path,
+            ]);
+
+            return false;
+        }
+
+        $backup->delete();
+
+        return true;
+    }
+
+    /**
+     * Mark a backup row failed with a clear error message.
+     *
+     * @param array<string, mixed> $extra
+     */
+    private function markFailed(Backup $backup, string $error, array $extra = []): Backup
+    {
+        $backup->update(array_merge([
+            'status' => 'failed',
+            'error' => $error,
+            'finished_at' => now(),
+        ], $extra));
+
+        return $backup;
+    }
+
+    /**
+     * Resolve (and create if needed) the temp directory for dumps/restores.
+     * Configurable via BACKUP_TMP_DIR so it can live outside Forge releases.
+     */
+    private function tmpDir(): string
+    {
+        $dir = rtrim((string) config('backup.tmp_dir', storage_path('app/tmp')), DIRECTORY_SEPARATOR);
+
+        if (! is_dir($dir)) {
+            @mkdir($dir, 0775, true);
+        }
+
+        if (! is_dir($dir) || ! is_writable($dir)) {
+            throw new RuntimeException("Backup temp dir is not writable: {$dir}");
+        }
+
+        return $dir;
+    }
+
+    /**
+     * Stream an S3 object into a local file.
+     *
+     * @throws RuntimeException when the object cannot be read or written
+     */
+    private function downloadToFile(string $s3Path, string $localPath): void
+    {
+        $in = $this->disk()->readStream($s3Path);
+
+        if (! is_resource($in)) {
+            throw new RuntimeException("Dump not found on S3: {$s3Path}");
+        }
+
+        try {
+            $out = fopen($localPath, 'wb');
+            if ($out === false) {
+                throw new RuntimeException("Could not open temp file for writing: {$localPath}");
+            }
+
+            try {
+                if (stream_copy_to_stream($in, $out) === false) {
+                    throw new RuntimeException("Failed to download dump from S3: {$s3Path}");
+                }
+            } finally {
+                fclose($out);
+            }
+        } finally {
+            if (is_resource($in)) {
+                fclose($in);
+            }
+        }
+    }
+
+    /**
+     * Ensure the downloaded dump has the expected size: the S3 object size, or
+     * the recorded size_bytes when the object size can't be read.
+     *
+     * @throws RuntimeException on mismatch or when no expected size is known
+     */
+    private function assertDownloadComplete(Backup $backup, string $tmpFile): void
+    {
+        clearstatcache(true, $tmpFile);
+        $local = is_file($tmpFile) ? (int) filesize($tmpFile) : -1;
+
+        try {
+            $expected = $this->disk()->size($backup->s3_path);
+        } catch (\Throwable $e) {
+            $expected = null;
+        }
+
+        if (! is_int($expected) || $expected <= 0) {
+            $expected = $backup->size_bytes !== null ? (int) $backup->size_bytes : null;
+        }
+
+        if ($expected === null || $expected <= 0) {
+            throw new RuntimeException("Cannot verify downloaded dump size for {$backup->s3_path}; restore aborted");
+        }
+
+        if ($local !== $expected) {
+            throw new RuntimeException("Downloaded dump is incomplete ({$local} of {$expected} bytes) for {$backup->s3_path}; restore aborted before pg_restore");
+        }
+    }
+
+    /**
+     * Delete an S3 object and confirm it is gone.
+     *
+     * True when delete() succeeded, or when the object no longer exists (e.g. it
+     * was already missing). False on any failure to delete/confirm.
+     */
+    private function deleteObject(string $s3Path): bool
+    {
+        try {
+            if ($this->disk()->delete($s3Path) === true) {
+                return true;
+            }
+        } catch (\Throwable $e) {
+            // fall through to the existence check
+        }
+
+        try {
+            return ! $this->disk()->exists($s3Path);
+        } catch (\Throwable $e) {
+            return false;
+        }
+    }
+
+    /**
+     * Best-effort removal of a partial / unverified upload. Never throws.
+     */
+    private function deleteObjectQuietly(string $s3Path): void
+    {
+        if (! $this->deleteObject($s3Path)) {
+            Log::warning('Backup: could not delete partial S3 object', ['s3_path' => $s3Path]);
+        }
     }
 
     /**

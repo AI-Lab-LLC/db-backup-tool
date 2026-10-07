@@ -48,6 +48,32 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Temp directory for dumps / restores
+    |--------------------------------------------------------------------------
+    |
+    | pg_dump writes here before upload and restores are staged here. Must have
+    | room for the largest dump. On Forge, point this OUTSIDE the release
+    | directory (e.g. /home/forge/backup-tmp) so deploys don't swap it away
+    | mid-backup.
+    |
+    */
+
+    'tmp_dir' => env('BACKUP_TMP_DIR') ?: storage_path('app/tmp'),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Failure alerts (opt-in)
+    |--------------------------------------------------------------------------
+    |
+    | Backup failures and stale databases are always logged (Log::error). When
+    | set, an e-mail is also sent to this address via the configured mailer.
+    |
+    */
+
+    'alert_email' => env('BACKUP_ALERT_EMAIL') ?: null,
+
+    /*
+    |--------------------------------------------------------------------------
     | Admin account (seeded by AdminUserSeeder)
     |--------------------------------------------------------------------------
     |

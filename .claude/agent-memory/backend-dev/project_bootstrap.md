@@ -17,3 +17,5 @@ Z1 bootstrap done: Laravel Framework 13.14.0 (composer constraint `laravel/frame
 `DB_CONNECTION=sqlite DB_DATABASE=/tmp/x.sqlite php artisan migrate --force` — do NOT migrate against the real pgsql connection locally.
 
 **Protected files (never overwrite):** `CLAUDE.md`, `backup_panel_spec_for_claude_cli.md`, `.codegraph/`, `.claude/`. Existing `.gitignore` already covered `.env`, `vendor`, `node_modules`, `storage/app/tmp`, `.codegraph/`.
+
+GOTCHA (2026-10-07): storage/framework/views/*.php (compiled Blade) ЗАКОМИЧЕНЫ в git, без .gitignore. Прогон тестов их перекомпилирует (грязный diff); `git checkout` возвращает СТАРЫЙ compiled с mtime новее исходника → Blade отдаёт устаревший шаблон. После revert делать `touch` исходной вьюхи; view-тесты компилируют вьюху явно (`app('blade.compiler')->compile(...)`).

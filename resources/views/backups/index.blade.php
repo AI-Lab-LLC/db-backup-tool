@@ -409,6 +409,8 @@
                                                     </button>
                                                 @endif
 
+                                                {{-- Удалить (не для выполняющихся бэкапов) --}}
+                                                @if ($backup->status !== 'running')
                                                 {{-- Удалить --}}
                                                 <form
                                                     action="{{ route('backups.destroy', $backup) }}"
@@ -424,6 +426,7 @@
                                                         Удалить
                                                     </button>
                                                 </form>
+                                                @endif
                                             </div>
                                         </td>
                                     </tr>

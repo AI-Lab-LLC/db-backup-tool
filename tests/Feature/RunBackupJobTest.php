@@ -1,0 +1,105 @@
+<?php
+
+namespace Tests\Feature;
+
+use App\Jobs\RunBackupJob;
+use App\Models\Backup;
+use App\Models\BackupConfig;
+use App\Services\BackupAlerter;
+use App\Services\BackupService;
+use Illuminate\Contracts\Queue\ShouldBeUnique;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Bus;
+use Mockery;
+use RuntimeException;
+use Tests\TestCase;
+
+class RunBackupJobTest extends TestCase
+{
+    use RefreshDatabase;
+
+    public function test_job_is_unique_per_database_for_longer_than_its_timeout(): void
+    {
+        $job = new RunBackupJob('nextdo', 'scheduled');
+
+        $this->assertInstanceOf(ShouldBeUnique::class, $job);
+        $this->assertSame('nextdo', $job->uniqueId());
+        $this->assertGreaterThan($job->timeout, $job->uniqueFor);
+    }
+
+    public function test_database_queue_retry_after_exceeds_job_timeout(): void
+    {
+        $this->assertGreaterThan(
+            (new RunBackupJob('x'))->timeout,
+            (int) config('queue.connections.database.retry_after'),
+        );
+    }
+
+    public function test_second_dispatch_for_same_database_is_dropped(): void
+    {
+        Bus::fake();
+
+        RunBackupJob::dispatch('nextdo', 'scheduled');
+        RunBackupJob::dispatch('nextdo', 'manual');
+        RunBackupJob::dispatch('breeze', 'manual');
+
+        Bus::assertDispatchedTimes(RunBackupJob::class, 2);
+        Bus::assertDispatched(RunBackupJob::class, fn ($j) => $j->database === 'nextdo' && $j->trigger === 'scheduled');
+        Bus::assertDispatched(RunBackupJob::class, fn ($j) => $j->database === 'breeze');
+    }
+
+    public function test_success_updates_last_run_at_then_prunes(): void
+    {
+        $config = BackupConfig::create(['database_name' => 'nextdo', 'retention_days' => 5, 'last_run_at' => null]);
+
+        $service = Mockery::mock(BackupService::class);
+        $service->shouldReceive('backup')->once()->with('nextdo', 'scheduled')->andReturn(new Backup(['status' => 'success']));
+        $service->shouldReceive('pruneOld')->once()->with('nextdo', 5)->andReturn(['deleted' => 0, 'kept' => 0]);
+
+        $alerter = Mockery::mock(BackupAlerter::class);
+        $alerter->shouldNotReceive('backupFailed');
+
+        (new RunBackupJob('nextdo', 'scheduled'))->handle($service, $alerter);
+
+        $this->assertNotNull($config->fresh()->last_run_at);
+    }
+
+    public function test_prune_exception_does_not_fail_a_successful_backup(): void
+    {
+        $config = BackupConfig::create(['database_name' => 'nextdo', 'retention_days' => 5]);
+
+        $service = Mockery::mock(BackupService::class);
+        $service->shouldReceive('backup')->andReturn(new Backup(['status' => 'success']));
+        $service->shouldReceive('pruneOld')->andThrow(new RuntimeException('s3 down'));
+
+        (new RunBackupJob('nextdo'))->handle($service, Mockery::mock(BackupAlerter::class));
+
+        $this->assertNotNull($config->fresh()->last_run_at);
+    }
+
+    public function test_failure_alerts_and_does_not_touch_last_run_at_or_prune(): void
+    {
+        $config = BackupConfig::create(['database_name' => 'nextdo', 'retention_days' => 5]);
+        $failed = new Backup(['status' => 'failed', 'error' => 'boom', 'database_name' => 'nextdo']);
+
+        $service = Mockery::mock(BackupService::class);
+        $service->shouldReceive('backup')->andReturn($failed);
+        $service->shouldNotReceive('pruneOld');
+
+        $alerter = Mockery::mock(BackupAlerter::class);
+        $alerter->shouldReceive('backupFailed')->once()->with($failed);
+
+        (new RunBackupJob('nextdo'))->handle($service, $alerter);
+
+        $this->assertNull($config->fresh()->last_run_at);
+    }
+
+    public function test_failed_hook_alerts(): void
+    {
+        $alerter = Mockery::mock(BackupAlerter::class);
+        $alerter->shouldReceive('jobFailed')->once()->with('nextdo', 'manual', Mockery::type(RuntimeException::class));
+        $this->app->instance(BackupAlerter::class, $alerter);
+
+        (new RunBackupJob('nextdo'))->failed(new RuntimeException('timeout'));
+    }
+}
