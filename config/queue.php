@@ -40,10 +40,11 @@ return [
             'connection' => env('DB_QUEUE_CONNECTION'),
             'table' => env('DB_QUEUE_TABLE', 'jobs'),
             'queue' => env('DB_QUEUE', 'default'),
-            // Must exceed RunBackupJob::$timeout (3700s): otherwise a still-running
-            // backup is re-reserved by another worker (concurrent pg_dump, false
-            // failure alert, unique lock released early).
-            'retry_after' => (int) env('DB_QUEUE_RETRY_AFTER', 3900),
+            // Must exceed RunBackupJob / RunRestoreJob $timeout (5400s) and their
+            // $uniqueFor (5600s): otherwise a still-running backup/restore is
+            // re-reserved by another worker (concurrent pg_dump / pg_restore,
+            // false failure alert, unique lock released early).
+            'retry_after' => (int) env('DB_QUEUE_RETRY_AFTER', 5700),
             'after_commit' => false,
         ],
 

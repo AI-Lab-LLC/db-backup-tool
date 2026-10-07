@@ -217,6 +217,102 @@
             @endif
 
             {{-- ================================================================
+                 БЛОК: Последние восстановления
+            ================================================================ --}}
+            <div class="bg-white overflow-hidden shadow-sm sm:rounded-lg">
+                <div class="px-6 py-4 border-b border-gray-200">
+                    <h3 class="text-lg font-semibold text-gray-900">Последние восстановления</h3>
+                    <p class="text-sm text-gray-500 mt-0.5">Восстановление выполняется в очереди; обновите страницу, чтобы увидеть результат</p>
+                </div>
+
+                @if ($restores->isEmpty())
+                    <div class="p-6 text-center text-sm text-gray-400">
+                        Восстановлений пока не было.
+                    </div>
+                @else
+                    <div class="overflow-x-auto">
+                        <table class="min-w-full divide-y divide-gray-200 text-sm">
+                            <thead class="bg-gray-50">
+                                <tr>
+                                    <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Источник</th>
+                                    <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Цель</th>
+                                    <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Статус</th>
+                                    <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Начало</th>
+                                    <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Конец</th>
+                                    <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Длительность</th>
+                                </tr>
+                            </thead>
+                            <tbody class="bg-white divide-y divide-gray-100">
+                                @foreach ($restores as $restore)
+                                    @php
+                                        $rClass = match($restore->status) {
+                                            'success' => 'bg-green-100 text-green-800',
+                                            'failed'  => 'bg-red-100 text-red-800',
+                                            'running' => 'bg-blue-100 text-blue-800',
+                                            default   => 'bg-gray-100 text-gray-600',
+                                        };
+                                        $rLabel = match($restore->status) {
+                                            'success' => 'Успех',
+                                            'failed'  => 'Ошибка',
+                                            'running' => 'Выполняется',
+                                            default   => 'В очереди',
+                                        };
+                                        $rSource = $restore->backup?->filename ?? $restore->database_name;
+                                        $rDuration = null;
+                                        if ($restore->started_at && $restore->finished_at) {
+                                            $secs = max(0, $restore->started_at->diffInSeconds($restore->finished_at, true));
+                                            $secs = (int) round($secs);
+                                            $rDuration = $secs >= 3600
+                                                ? intdiv($secs, 3600) . ' ч ' . intdiv($secs % 3600, 60) . ' мин'
+                                                : ($secs >= 60 ? intdiv($secs, 60) . ' мин ' . ($secs % 60) . ' с' : $secs . ' с');
+                                        }
+                                    @endphp
+                                    <tr class="hover:bg-gray-50 align-top">
+                                        <td class="px-4 py-3 max-w-xs">
+                                            <span class="block truncate font-mono text-xs text-gray-700" title="{{ $rSource }}">{{ $rSource }}</span>
+                                        </td>
+                                        <td class="px-4 py-3 font-mono text-sm text-gray-900 whitespace-nowrap">{{ $restore->target_database }}</td>
+                                        <td class="px-4 py-3">
+                                            <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium {{ $rClass }}">
+                                                @if ($restore->status === 'running')
+                                                    <svg class="animate-spin h-3 w-3" fill="none" viewBox="0 0 24 24">
+                                                        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                                                        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path>
+                                                    </svg>
+                                                @endif
+                                                {{ $rLabel }}
+                                            </span>
+                                            @if ($restore->status === 'failed' && $restore->error)
+                                                <details class="mt-1 max-w-xs">
+                                                    <summary class="text-xs text-red-600 cursor-pointer truncate" title="{{ $restore->error }}">
+                                                        {{ Str::limit($restore->error, 80) }}
+                                                    </summary>
+                                                    <pre class="mt-1 text-xs text-red-700 whitespace-pre-wrap break-words max-h-48 overflow-y-auto">{{ $restore->error }}</pre>
+                                                </details>
+                                            @endif
+                                        </td>
+                                        <td class="px-4 py-3 text-gray-500 text-xs whitespace-nowrap">
+                                            {{ $restore->started_at ? $restore->started_at->format('d.m.Y H:i') : '—' }}
+                                        </td>
+                                        <td class="px-4 py-3 text-gray-500 text-xs whitespace-nowrap">
+                                            {{ $restore->finished_at ? $restore->finished_at->format('d.m.Y H:i') : '—' }}
+                                        </td>
+                                        <td class="px-4 py-3 text-gray-500 text-xs whitespace-nowrap">{{ $rDuration ?? '—' }}</td>
+                                    </tr>
+                                @endforeach
+                            </tbody>
+                        </table>
+                    </div>
+                @endif
+            </div>
+
+            <datalist id="restore_targets">
+                @foreach ($restoreTargets as $t)
+                    <option value="{{ $t }}"></option>
+                @endforeach
+            </datalist>
+
+            {{-- ================================================================
                  БЛОК 4: История бэкапов
                  Alpine x-data задан на <tbody> для каждой пары строк
             ================================================================ --}}
@@ -352,7 +448,7 @@
 
                                 {{-- tbody с Alpine x-data — scope для showRestore и confirmed --}}
                                 <tbody
-                                    x-data="{ showRestore: false, confirmed: false }"
+                                    x-data="{ showRestore: false, confirmed: false, confirmMismatch: false, source: @js($backup->database_name), target: @js($backup->database_name), get mismatch() { return this.target.trim() !== this.source }, get canSubmit() { return this.confirmed && this.target.trim() !== '' && (!this.mismatch || this.confirmMismatch) } }"
                                     class="divide-y divide-gray-100"
                                 >
                                     {{-- Основная строка бэкапа --}}
@@ -402,11 +498,22 @@
                                                 @if ($backup->status === 'success')
                                                     <button
                                                         type="button"
-                                                        @click="showRestore = !showRestore; if (!showRestore) confirmed = false"
+                                                        @click="showRestore = !showRestore; if (!showRestore) { confirmed = false; confirmMismatch = false }"
                                                         class="inline-flex items-center justify-center px-3 py-1 bg-orange-50 border border-orange-300 rounded text-xs font-medium text-orange-700 hover:bg-orange-100 transition duration-150"
                                                     >
                                                         <span x-text="showRestore ? 'Скрыть' : 'Restore'">Restore</span>
                                                     </button>
+                                                @endif
+
+                                                {{-- Выполняющийся бэкап — вместо кнопок индикатор --}}
+                                                @if ($backup->status === 'running')
+                                                    <span class="inline-flex items-center gap-1.5 text-xs text-yellow-700">
+                                                        <svg class="animate-spin h-4 w-4" fill="none" viewBox="0 0 24 24">
+                                                            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                                                            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path>
+                                                        </svg>
+                                                        выполняется
+                                                    </span>
                                                 @endif
 
                                                 {{-- Удалить (не для выполняющихся бэкапов) --}}
@@ -455,6 +562,10 @@
                                                                 <code class="bg-red-200 px-1 rounded font-mono text-xs">pg_restore --clean --if-exists --no-owner</code>
                                                                 — все таблицы и данные целевой базы будут удалены и заменены данными из дампа.
                                                             </p>
+                                                            <p class="text-sm text-red-700 mt-1 leading-relaxed">
+                                                                Восстановление выполняется в фоне (очередь), а не сразу: результат появится
+                                                                в блоке «Последние восстановления» на этой странице.
+                                                            </p>
                                                             <p class="text-sm font-bold text-red-800 mt-2">
                                                                 Убедитесь, что вы указываете правильную целевую базу данных!
                                                             </p>
@@ -486,10 +597,14 @@
                                                             type="text"
                                                             id="target_database_{{ $backup->id }}"
                                                             name="target_database"
-                                                            value="{{ $backup->database_name }}"
+                                                            x-model="target"
+                                                            @input="confirmMismatch = false"
+                                                            list="restore_targets"
+                                                            maxlength="63"
                                                             pattern="[A-Za-z0-9_]+"
+                                                            autocomplete="off"
                                                             required
-                                                            class="w-full"
+                                                            class="w-full font-mono"
                                                         />
                                                         <p class="mt-1 text-xs text-gray-400">
                                                             Только латинские буквы, цифры и символ подчёркивания
@@ -516,13 +631,40 @@
                                                         </label>
                                                     </div>
 
+                                                    {{-- Подтверждение для ДРУГОЙ базы — только если цель != источник --}}
+                                                    <div x-show="mismatch" x-cloak class="rounded-lg bg-red-100 border-2 border-red-600 p-4">
+                                                        <p class="text-sm font-bold text-red-800 uppercase tracking-wide">
+                                                            Цель отличается от исходной базы!
+                                                        </p>
+                                                        <p class="text-sm text-red-700 mt-1 leading-relaxed">
+                                                            Вы восстанавливаете дамп базы
+                                                            <strong class="font-mono">{{ $backup->database_name }}</strong>
+                                                            в ДРУГУЮ базу
+                                                            <strong class="font-mono" x-text="target"></strong>.
+                                                            Все данные в ней будут <strong>ПЕРЕЗАПИСАНЫ</strong>.
+                                                        </p>
+                                                        <label class="flex items-start gap-3 cursor-pointer mt-3">
+                                                            <input
+                                                                type="checkbox"
+                                                                name="confirm_mismatch"
+                                                                value="1"
+                                                                x-model="confirmMismatch"
+                                                                :disabled="!mismatch"
+                                                                class="mt-0.5 h-4 w-4 rounded border-gray-300 text-red-600 shadow-sm focus:ring-red-500"
+                                                            >
+                                                            <span class="text-sm text-gray-800 leading-snug">
+                                                                Да, я хочу перезаписать <strong>другую</strong> базу данных.
+                                                            </span>
+                                                        </label>
+                                                    </div>
+
                                                     {{-- Кнопки --}}
                                                     <div class="flex items-center gap-3">
-                                                        {{-- Submit — заблокирован пока confirmed=false --}}
+                                                        {{-- Submit — заблокирован пока не отмечены подтверждения --}}
                                                         <button
                                                             type="submit"
-                                                            :disabled="!confirmed"
-                                                            :class="confirmed
+                                                            :disabled="!canSubmit"
+                                                            :class="canSubmit
                                                                 ? 'bg-red-600 hover:bg-red-700 cursor-pointer'
                                                                 : 'bg-red-300 cursor-not-allowed opacity-60 pointer-events-none'"
                                                             class="inline-flex items-center px-5 py-2 border border-transparent rounded-md text-sm font-semibold text-white transition ease-in-out duration-150 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-2"
@@ -531,7 +673,7 @@
                                                         </button>
                                                         <button
                                                             type="button"
-                                                            @click="showRestore = false; confirmed = false"
+                                                            @click="showRestore = false; confirmed = false; confirmMismatch = false"
                                                             class="inline-flex items-center px-5 py-2 bg-white border border-gray-300 rounded-md text-sm font-medium text-gray-700 hover:bg-gray-50 transition ease-in-out duration-150"
                                                         >
                                                             Отмена

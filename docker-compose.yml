@@ -131,7 +131,7 @@ services:
     #   - "traefik.http.services.backup-panel.loadbalancer.server.port=8000"
 
   # ---------------------------------------------------------------------------
-  # Queue worker — runs RunBackupJob (timeout ~3700s, per invariants).
+  # Queue worker — runs RunBackupJob / RunRestoreJob (job $timeout 5400s; DB_QUEUE_RETRY_AFTER must stay > 5600).
   # ---------------------------------------------------------------------------
   queue:
     image: backup-panel:latest
@@ -140,7 +140,7 @@ services:
     environment:
       <<: *app-env
       CONTAINER_ROLE: queue
-    command: ["php", "artisan", "queue:work", "--timeout=3700", "--tries=2", "--sleep=3"]
+    command: ["php", "artisan", "queue:work", "--timeout=5400", "--tries=2", "--sleep=3"]
     depends_on:
       - web
     volumes:

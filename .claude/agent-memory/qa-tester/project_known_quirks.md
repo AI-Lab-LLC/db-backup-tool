@@ -12,5 +12,7 @@ Backup Panel review notes (updated 2026-10-07):
 - **Tests use `CACHE_STORE=array`, `QUEUE_CONNECTION=sync`.** ShouldBeUnique locks and schedule `withoutOverlapping` mutexes on the prod `database` cache store aren't exercised; reason about them from vendor code (Laravel 13: CallQueuedHandler releases unique lock on success and on final failed()).
 - The history view shows "Delete" for every status, including `running`. Watch for in-flight-row deletion.
 
+- **TrustProxies on-forge fallback:** Laravel's TrustProxies treats `trustedproxy.proxies === null` + host `*.on-forge.com`/`*.on-vapor.com`/Laravel Cloud as `'*'`. Prod host is `*.on-forge.com`, so a null default makes XFF spoofable (IP allowlist bypass). Tests on `localhost` don't catch it — probe with an on-forge Host.
+
 **Why:** these came up as real bugs in the 2026-10-07 reliability review.
 **How to apply:** check them first when reviewing backup/prune/delete changes.

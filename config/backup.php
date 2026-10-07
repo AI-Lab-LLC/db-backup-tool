@@ -22,6 +22,12 @@ return [
         'port' => env('PG_PORT', 5432),
         'user' => env('PG_USER', 'backup_admin'),
         'password' => env('PG_PASSWORD', ''),
+
+        // Directory holding pg_dump / pg_restore / psql. Empty = bare names via
+        // PATH. The client major version must match the server (PG 17); on prod
+        // the default PATH resolves to client 18, so point this at
+        // /usr/lib/postgresql/17/bin there.
+        'bin_dir' => env('PG_BIN_DIR', ''),
     ],
 
     /*
@@ -82,6 +88,19 @@ return [
     | so the seeder still works under `config:cache`.
     |
     */
+
+    /*
+    |--------------------------------------------------------------------------
+    | Panel access control
+    |--------------------------------------------------------------------------
+    |
+    | allowed_ips: comma-separated IPs / CIDRs allowed to reach ANY web route
+    | (login included), enforced by App\Http\Middleware\RestrictPanelIps.
+    | Empty = allow all. Trusted proxies: config/trustedproxy.php.
+    |
+    */
+
+    'allowed_ips' => env('PANEL_ALLOWED_IPS', ''),
 
     'admin' => [
         'name' => env('ADMIN_NAME', 'Admin'),

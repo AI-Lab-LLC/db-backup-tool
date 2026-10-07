@@ -25,9 +25,12 @@ class RunBackupJob implements ShouldQueue, ShouldBeUnique
     use SerializesModels;
 
     /**
-     * Wall-clock timeout for the job, kept above the pg_* PROCESS_TIMEOUT (3600).
+     * Wall-clock timeout for the job: pg_dump (PROCESS_TIMEOUT 3600) plus the
+     * archive check and the S3 upload. Ordering invariant (guarded by tests):
+     * $timeout (5400) < $uniqueFor (5600) < queue retry_after (5700) <
+     * BackupService::STALE_RUNNING_MINUTES * 60 (9000).
      */
-    public int $timeout = 3700;
+    public int $timeout = 5400;
 
     /**
      * Number of attempts before the job is considered failed.
@@ -39,7 +42,7 @@ class RunBackupJob implements ShouldQueue, ShouldBeUnique
      * killed mid-job cannot block the database forever. The lock is released as
      * soon as the job finishes or finally fails.
      */
-    public int $uniqueFor = 4000;
+    public int $uniqueFor = 5600;
 
     public function __construct(
         public string $database,
@@ -58,6 +61,9 @@ class RunBackupJob implements ShouldQueue, ShouldBeUnique
 
     /**
      * Queue a backup unless one for this database is already queued/running.
+     *
+     * Note: RunRestoreJob also holds this lock (for its target database) while
+     * it runs, so a backup can't be queued during a restore.
      *
      * Plain dispatch() silently drops a job whose unique lock is held, so the
      * caller can't tell. Here the lock is taken explicitly and the job is sent
@@ -87,6 +93,25 @@ class RunBackupJob implements ShouldQueue, ShouldBeUnique
     }
 
     /**
+     * Whether a backup of $database is queued or running (its unique lock is
+     * held — also held by a running restore of $database). Non-destructive
+     * probe: the lock is released again immediately if it was free.
+     */
+    public static function isQueuedOrRunning(string $database): bool
+    {
+        $job = new static($database);
+        $lock = new UniqueLock(app(Cache::class));
+
+        if (! $lock->acquire($job)) {
+            return true;
+        }
+
+        $lock->release($job);
+
+        return false;
+    }
+
+    /**
      * Run the backup via BackupService.
      *
      * HARD INVARIANT: backups.last_run_at is mutated ONLY here, and only after a
@@ -94,6 +119,31 @@ class RunBackupJob implements ShouldQueue, ShouldBeUnique
      * BackupService::backup() never touches last_run_at.
      */
     public function handle(BackupService $service, BackupAlerter $alerter): void
+    {
+        // A restore of this database is running (RunRestoreJob holds the
+        // shared lock): skip WITHOUT creating a backup row. No row means no
+        // failure backoff and last_run_at stays put, so backups:dispatch simply
+        // re-dispatches once the restore is done. Not release()d: that would
+        // burn one of $tries (false failed() alert after a long restore).
+        $busy = DatabaseBusyLock::for($this->database);
+
+        if (! $busy->get()) {
+            Log::warning('Backup skipped: a restore of this database is in progress', [
+                'database' => $this->database,
+                'trigger' => $this->trigger,
+            ]);
+
+            return;
+        }
+
+        try {
+            $this->runBackup($service, $alerter);
+        } finally {
+            $busy->release();
+        }
+    }
+
+    private function runBackup(BackupService $service, BackupAlerter $alerter): void
     {
         $backup = $service->backup($this->database, $this->trigger);
 

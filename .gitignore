@@ -35,3 +35,9 @@ _ide_helper.php
 
 # CodeGraph index (local, rebuildable)
 .codegraph/
+
+# compiled Blade views (rebuilt at runtime) and transient QA checklist
+/storage/framework/views/*
+!/storage/framework/views/.gitignore
+/checklist.md
+/database/database.sqlite

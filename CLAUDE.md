@@ -20,7 +20,7 @@ broken index. Don't re-init; read the spec and implement.
 ## Hard invariants (do not violate)
 - **`PGPASSWORD` via process env only — never in CLI argv** (it shows in `ps`).
 - **Layer decoupling**: controllers and jobs call into `App\Services\BackupService`; they never run processes directly. `backups.last_run_at` is mutated **only** by `RunBackupJob` (after a successful backup, which then calls `pruneOld()`).
-- **Backups run in a queued Job** (`RunBackupJob`, `ShouldQueue`, timeout ~3700), never in a web request.
+- **Backups run in a queued Job** (`RunBackupJob`, `ShouldQueue`, timeout 5400 — retry_after 5700, unique lock 5600, stale 150 min; see RunBackupJob), never in a web request.
 - **Restore is destructive**: requires an explicit confirmation checkbox + warning before submit; validate database names and the restore target. `restore()` uses `pg_restore --clean --if-exists --no-owner`; treat it as failed **only when stderr contains `FATAL`** (warnings on stderr are normal).
 - `backup()` dumps custom format (`-Fc`) to `storage/app/tmp`, uploads to S3 key `postgres-backups/{db}/{db}_{timestamp}.dump`, and deletes the temp file in a `finally`.
 - Retention cleanup (`pruneOld`) runs after each successful backup.

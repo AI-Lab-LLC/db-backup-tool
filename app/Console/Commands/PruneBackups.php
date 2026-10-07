@@ -17,7 +17,7 @@ class PruneBackups extends Command
     /**
      * @var string
      */
-    protected $description = 'Mark stale running backups failed, then apply retention to every configured database';
+    protected $description = 'Mark stale running backups/restores failed, then apply retention to every configured database';
 
     /**
      * Only calls BackupService — never touches processes, S3 or last_run_at.
@@ -26,6 +26,9 @@ class PruneBackups extends Command
     {
         $stale = $service->markStaleRunning();
         $this->info("Marked {$stale} stale running backup(s) as failed.");
+
+        $staleRestores = $service->markStaleRestores();
+        $this->info("Marked {$staleRestores} stale queued/running restore(s) as failed.");
 
         $deleted = 0;
         $kept = 0;

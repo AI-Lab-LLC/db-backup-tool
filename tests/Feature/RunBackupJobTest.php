@@ -2,7 +2,9 @@
 
 namespace Tests\Feature;
 
+use App\Jobs\DatabaseBusyLock;
 use App\Jobs\RunBackupJob;
+use App\Jobs\RunRestoreJob;
 use App\Models\Backup;
 use App\Models\BackupConfig;
 use App\Services\BackupAlerter;
@@ -29,10 +31,52 @@ class RunBackupJobTest extends TestCase
 
     public function test_database_queue_retry_after_exceeds_job_timeout(): void
     {
-        $this->assertGreaterThan(
-            (new RunBackupJob('x'))->timeout,
-            (int) config('queue.connections.database.retry_after'),
-        );
+        $retryAfter = (int) config('queue.connections.database.retry_after');
+
+        foreach ([new RunBackupJob('x'), new RunRestoreJob(1, 'x')] as $job) {
+            $this->assertGreaterThan($job->timeout, $retryAfter, $job::class . ' timeout');
+            $this->assertGreaterThan($job->uniqueFor, $retryAfter, $job::class . ' uniqueFor');
+            $this->assertGreaterThan($job->timeout, $job->uniqueFor, $job::class . ' uniqueFor > timeout');
+            $this->assertGreaterThan($job->timeout, DatabaseBusyLock::TTL_SECONDS, $job::class . ' busy-lock TTL');
+        }
+    }
+
+    public function test_stale_running_threshold_exceeds_every_job_timeout(): void
+    {
+        foreach ([new RunBackupJob('x'), new RunRestoreJob(1, 'x')] as $job) {
+            $this->assertGreaterThan($job->timeout, BackupService::STALE_RUNNING_MINUTES * 60, $job::class);
+        }
+    }
+
+    public function test_job_skips_without_a_row_while_database_busy_lock_is_held(): void
+    {
+        $config = BackupConfig::create(['database_name' => 'nextdo', 'retention_days' => 5]);
+        $lock = DatabaseBusyLock::for('nextdo');
+        $this->assertTrue($lock->get());
+
+        $service = Mockery::mock(BackupService::class);
+        $service->shouldNotReceive('backup');
+        $alerter = Mockery::mock(BackupAlerter::class);
+        $alerter->shouldNotReceive('backupFailed');
+
+        (new RunBackupJob('nextdo', 'scheduled'))->handle($service, $alerter);
+
+        $this->assertSame(0, Backup::count());
+        $this->assertNull($config->fresh()->last_run_at);
+
+        $lock->release();
+    }
+
+    public function test_job_releases_database_busy_lock_after_run(): void
+    {
+        $service = Mockery::mock(BackupService::class);
+        $service->shouldReceive('backup')->andReturn(new Backup(['status' => 'failed', 'database_name' => 'nextdo']));
+
+        (new RunBackupJob('nextdo'))->handle($service, Mockery::spy(BackupAlerter::class));
+
+        $lock = DatabaseBusyLock::for('nextdo');
+        $this->assertTrue($lock->get(), 'busy lock must be released in finally');
+        $lock->release();
     }
 
     public function test_second_dispatch_for_same_database_is_dropped(): void

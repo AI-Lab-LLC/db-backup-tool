@@ -29,6 +29,7 @@ class BackupCommandsAndAlertsTest extends TestCase
 
         $service = Mockery::mock(BackupService::class);
         $service->shouldReceive('markStaleRunning')->once()->ordered()->andReturn(2);
+        $service->shouldReceive('markStaleRestores')->once()->ordered()->andReturn(0);
         $service->shouldReceive('pruneOld')->once()->ordered()->with('nextdo', 7)->andReturn(['deleted' => 3, 'kept' => 1]);
         $service->shouldNotReceive('pruneOld')->with('breeze', Mockery::any());
         $this->app->instance(BackupService::class, $service);

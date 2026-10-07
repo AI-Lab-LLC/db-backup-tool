@@ -5,6 +5,7 @@ namespace App\Console\Commands;
 use App\Jobs\RunBackupJob;
 use App\Models\Backup;
 use App\Models\BackupConfig;
+use App\Models\Restore;
 use App\Services\BackupService;
 use Illuminate\Console\Command;
 
@@ -29,15 +30,19 @@ class DispatchScheduledBackups extends Command
      *
      * On top of dueForBackup() (unchanged), a due config is skipped when:
      *  - it already has a 'running' Backup row (one in flight), or
+     *  - a Restore into it is queued or running (backups and restores of the
+     *    same database are mutually exclusive), or
      *  - its latest SCHEDULED Backup row is 'failed' and less than interval_minutes old
      *    (failure backoff — a failed run does not move last_run_at, so without
      *    this a broken database would be re-dumped every minute).
-     * Dead 'running' rows are first marked failed via the service so they can
-     * never block a database indefinitely.
+     * Dead 'running' backup rows and dead queued/running restore rows are first
+     * marked failed via the service so they can never block a database
+     * indefinitely.
      */
     public function handle(BackupService $service): int
     {
         $service->markStaleRunning();
+        $service->markStaleRestores();
 
         $dispatched = 0;
 
@@ -56,6 +61,12 @@ class DispatchScheduledBackups extends Command
 
                 if ($running) {
                     $this->line("Skip {$config->database_name}: a backup is already running.");
+
+                    return;
+                }
+
+                if (Restore::activeFor($config->database_name)) {
+                    $this->line("Skip {$config->database_name}: a restore into it is queued or running.");
 
                     return;
                 }

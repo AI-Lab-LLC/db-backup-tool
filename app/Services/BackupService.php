@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use App\Models\Backup;
+use App\Models\Restore;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 use RuntimeException;
@@ -16,12 +17,19 @@ class BackupService
     private const PROCESS_TIMEOUT = 3600;
 
     /**
-     * A 'running' row older than this (minutes) is considered dead. Must stay
-     * above RunBackupJob::$timeout (3700s).
+     * A 'running' backup row (or a queued/running restore row) older than this
+     * (minutes) is considered dead. Must stay above RunBackupJob::$timeout and
+     * RunRestoreJob::$timeout (5400s = 90 min); guarded by a test.
      */
-    public const STALE_RUNNING_MINUTES = 120;
+    public const STALE_RUNNING_MINUTES = 150;
 
     public const STALE_RUNNING_ERROR = 'stale: worker died / timed out';
+
+    /**
+     * Databases a restore may never target (besides the panel's own metadata
+     * database, read from config at call time).
+     */
+    public const RESTORE_DENYLIST = ['postgres', 'template0', 'template1'];
 
     /**
      * Discover every connectable, non-template database on the PostgreSQL server.
@@ -38,7 +46,7 @@ class BackupService
             . 'ORDER BY datname';
 
         $process = $this->makeProcess([
-            'psql',
+            $this->bin('psql'),
             ...$this->connectionArgs(),
             '-d', 'postgres',
             '-t',  // tuples only (no header / footer)
@@ -112,7 +120,7 @@ class BackupService
             $tmpFile = $this->tmpDir() . DIRECTORY_SEPARATOR . "backup_{$backup->id}_{$filename}";
 
             $process = $this->makeProcess([
-                'pg_dump',
+                $this->bin('pg_dump'),
                 '-Fc',                 // custom (compressed) archive format
                 ...$this->connectionArgs(),
                 '-d', $database,
@@ -132,6 +140,14 @@ class BackupService
 
             if ($localSize <= 0) {
                 return $this->markFailed($backup, 'pg_dump reported success but the dump file is missing or empty');
+            }
+
+            // Make sure the archive is readable (TOC parses) before it becomes
+            // "the backup": a corrupt dump must never be uploaded as success.
+            $validationError = $this->validateArchive($tmpFile);
+
+            if ($validationError !== null) {
+                return $this->markFailed($backup, "dump archive validation failed: {$validationError}");
             }
 
             // Stream the dump to S3 (avoids loading the whole file into memory).
@@ -216,8 +232,13 @@ class BackupService
      */
     public function restore(Backup $backup, string $targetDatabase): void
     {
-        if (! $this->isValidDatabaseName($targetDatabase)) {
-            throw new RuntimeException("Invalid target database name: {$targetDatabase}");
+        // Static guards (name format + denylist incl. the panel's own DB) are
+        // re-checked here so no caller can bypass them; existence on the server
+        // is checked by restoreTargetError() before the restore is queued.
+        $error = self::staticRestoreTargetError($targetDatabase);
+
+        if ($error !== null) {
+            throw new RuntimeException($error);
         }
 
         $tmpFile = $this->tmpDir() . DIRECTORY_SEPARATOR . 'restore_' . $backup->id . '_' . basename($backup->filename);
@@ -232,7 +253,7 @@ class BackupService
             $this->assertDownloadComplete($backup, $tmpFile);
 
             $process = $this->makeProcess([
-                'pg_restore',
+                $this->bin('pg_restore'),
                 '--clean',
                 '--if-exists',
                 '--no-owner',
@@ -254,6 +275,63 @@ class BackupService
                 @unlink($tmpFile);
             }
         }
+    }
+
+    /**
+     * Why $target may NOT be used as a restore target, or null when allowed.
+     *
+     * Rejected: names not matching /^[A-Za-z0-9_]+$/, the panel's own metadata
+     * database (config database.connections.pgsql.database), postgres /
+     * template0 / template1, and databases that do not exist on the server.
+     * Existence is checked with a fresh listDatabases() call (never cached).
+     *
+     * @return string|null a human-readable (Russian, UI-facing) reason, or null
+     */
+    public function restoreTargetError(string $target): ?string
+    {
+        $error = self::staticRestoreTargetError($target);
+
+        if ($error !== null) {
+            return $error;
+        }
+
+        try {
+            $exists = in_array($target, $this->listDatabases(), true);
+        } catch (\Throwable $e) {
+            return "не удалось проверить наличие базы «{$target}» на сервере PostgreSQL: " . $e->getMessage();
+        }
+
+        return $exists ? null : "база «{$target}» не существует на сервере PostgreSQL";
+    }
+
+    /**
+     * Whether $target is an allowed restore target (see restoreTargetError()).
+     */
+    public function isRestoreTargetAllowed(string $target): bool
+    {
+        return $this->restoreTargetError($target) === null;
+    }
+
+    /**
+     * Mark restores stuck in queued/running longer than STALE_RUNNING_MINUTES
+     * as failed. Such a row can only belong to a lost job or a dead worker, and
+     * would otherwise block scheduled backups of its target database forever.
+     *
+     * @return int number of rows marked failed
+     */
+    public function markStaleRestores(): int
+    {
+        $threshold = now()->subMinutes(self::STALE_RUNNING_MINUTES);
+
+        return Restore::query()
+            ->whereIn('status', [Restore::STATUS_QUEUED, Restore::STATUS_RUNNING])
+            ->where(fn ($q) => $q->where('started_at', '<', $threshold)
+                ->orWhere(fn ($q) => $q->whereNull('started_at')->where('created_at', '<', $threshold)))
+            ->update([
+                'status' => Restore::STATUS_FAILED,
+                'error' => self::STALE_RUNNING_ERROR,
+                'finished_at' => now(),
+            ]);
     }
 
     /**
@@ -291,10 +369,15 @@ class BackupService
             ->where('status', 'success')
             ->max('id');
 
+        // Backups a queued/running restore still reads from are kept until it
+        // finishes (the next prune picks them up).
+        $inUseByRestore = Restore::query()->active()->whereNotNull('backup_id')->pluck('backup_id')->all();
+
         $expired = Backup::query()
             ->where('database_name', $database)
             ->where('created_at', '<', $cutoff)
             ->when($newestSuccessId !== null, fn ($q) => $q->where('id', '!=', $newestSuccessId))
+            ->when($inUseByRestore !== [], fn ($q) => $q->whereNotIn('id', $inUseByRestore))
             ->orderBy('id')
             ->get();
 
@@ -333,7 +416,7 @@ class BackupService
     /**
      * Mark rows stuck in 'running' longer than STALE_RUNNING_MINUTES as failed.
      *
-     * The threshold (2h) is well above RunBackupJob's timeout (3700s), so such a
+     * The threshold (150 min) is well above RunBackupJob's timeout (5400s), so such a
      * row can only belong to a worker that died or was killed.
      *
      * @return int number of rows marked failed
@@ -367,7 +450,74 @@ class BackupService
             '-h', (string) config('backup.pg.host'),
             '-p', (string) config('backup.pg.port'),
             '-U', (string) config('backup.pg.user'),
+            '-w', // --no-password: a wrong/missing PGPASSWORD fails fast instead of prompting
         ];
+    }
+
+    /**
+     * Resolve a PostgreSQL client binary: "{backup.pg.bin_dir}/{name}" when
+     * configured (pin the client major version to the server's), else the bare
+     * name looked up on PATH.
+     */
+    private function bin(string $name): string
+    {
+        $dir = rtrim(trim((string) config('backup.pg.bin_dir', '')), '/');
+
+        return $dir === '' ? $name : "{$dir}/{$name}";
+    }
+
+    /**
+     * Run `pg_restore --list` on a local dump to confirm the archive is
+     * readable. No connection is made, so no connection args are passed.
+     *
+     * @return string|null failure detail, or null when the archive is valid
+     */
+    private function validateArchive(string $file): ?string
+    {
+        $process = $this->makeProcess([
+            $this->bin('pg_restore'),
+            '--list',
+            $file,
+        ]);
+
+        $process->run();
+
+        $stderr = trim($process->getErrorOutput());
+
+        if ($process->isSuccessful() && ! $this->hasFatal($stderr)) {
+            return null;
+        }
+
+        return $stderr !== '' ? $stderr : 'pg_restore --list exited with status ' . $process->getExitCode();
+    }
+
+    /**
+     * Restore-target checks that need no server round-trip (name format,
+     * system databases, the panel's own metadata DB). Static so views/lists can
+     * filter with it without a service instance.
+     */
+    public static function staticRestoreTargetError(string $target): ?string
+    {
+        if ($target === '' || preg_match('/^[A-Za-z0-9_]+$/', $target) !== 1) {
+            return "недопустимое имя базы «{$target}» (разрешены только A-Z, a-z, 0-9, _)";
+        }
+
+        if (in_array(strtolower($target), self::RESTORE_DENYLIST, true)) {
+            return "восстановление в системную базу «{$target}» запрещено";
+        }
+
+        // Resolved through the connection so DB_URL-based setups are covered too.
+        try {
+            $panelDb = (string) \Illuminate\Support\Facades\DB::connection('pgsql')->getDatabaseName();
+        } catch (\Throwable) {
+            $panelDb = (string) config('database.connections.pgsql.database');
+        }
+
+        if ($panelDb !== '' && strcasecmp($target, $panelDb) === 0) {
+            return "восстановление в служебную базу панели «{$target}» запрещено";
+        }
+
+        return null;
     }
 
     /**
@@ -409,14 +559,6 @@ class BackupService
     private function hasFatal(string $stderr): bool
     {
         return str_contains($stderr, 'FATAL');
-    }
-
-    /**
-     * Validate a PostgreSQL database name we are about to pass to pg_restore.
-     */
-    private function isValidDatabaseName(string $name): bool
-    {
-        return $name !== '' && preg_match('/^[A-Za-z0-9_]+$/', $name) === 1;
     }
 
     /**

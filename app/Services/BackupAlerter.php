@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use App\Models\Backup;
+use App\Models\Restore;
 use App\Notifications\BackupAlert;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Notification;
@@ -41,6 +42,35 @@ class BackupAlerter
                 'Error: ' . $e->getMessage(),
             ],
             ['database' => $database, 'exception' => $e::class],
+        );
+    }
+
+    public function restoreFailed(Restore $restore): void
+    {
+        $this->alert(
+            "[backup-panel] Restore FAILED: {$restore->target_database}",
+            [
+                "Target database: {$restore->target_database}",
+                "Source: {$restore->database_name} (backup #" . ($restore->backup_id ?? '-') . ')',
+                "Restore #{$restore->id}, requested by user #" . ($restore->user_id ?? '-'),
+                'Started: ' . ($restore->started_at?->toDateTimeString() ?? '-'),
+                'Error: ' . ($restore->error ?: '-'),
+            ],
+            ['restore_id' => $restore->id, 'target' => $restore->target_database, 'backup_id' => $restore->backup_id],
+        );
+    }
+
+    public function databaseDisabled(string $database, ?string $byEmail): void
+    {
+        $by = $byEmail ?? 'unknown user';
+
+        $this->alert(
+            "[backup-panel] Backups disabled: {$database}",
+            [
+                "Database {$database} disabled by {$by}.",
+                'Scheduled backups for it will no longer run until it is re-enabled.',
+            ],
+            ['database' => $database, 'by' => $by],
         );
     }
 
