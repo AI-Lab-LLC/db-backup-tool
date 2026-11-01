@@ -1,0 +1,59 @@
+# Production image for Coolify (backup.ailab.am): nginx + php-fpm 8.5 +
+# queue workers + scheduler in one container (supervisord), PostgreSQL 17
+# client for pg_dump / pg_restore / psql (same major as the DB server).
+# The plain Dockerfile stays the local docker-compose image.
+FROM node:22-alpine AS assets
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY . .
+RUN npm run build
+
+FROM php:8.5-fpm-trixie
+
+COPY --from=mlocati/php-extension-installer:2.7 /usr/bin/install-php-extensions /usr/local/bin/
+COPY --from=composer:2.8 /usr/bin/composer /usr/local/bin/composer
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends nginx supervisor curl ca-certificates gnupg unzip git; \
+    install -d /usr/share/postgresql-common/pgdg; \
+    curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc; \
+    echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] http://apt.postgresql.org/pub/repos/apt trixie-pgdg main" > /etc/apt/sources.list.d/pgdg.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends postgresql-client-17; \
+    install-php-extensions pdo_pgsql pgsql gd intl zip bcmath exif pcntl opcache; \
+    rm -rf /var/lib/apt/lists/* /etc/nginx/sites-enabled/default
+
+COPY docker/coolify/php.ini /usr/local/etc/php/conf.d/zz-app.ini
+COPY docker/coolify/php-fpm.conf /usr/local/etc/php-fpm.d/zz-app.conf
+COPY docker/coolify/nginx.conf /etc/nginx/conf.d/default.conf
+COPY docker/coolify/supervisord.conf /etc/supervisor/conf.d/app.conf
+COPY docker/coolify/entrypoint.sh /usr/local/bin/entrypoint.sh
+
+WORKDIR /var/www/html
+
+COPY composer.json composer.lock ./
+RUN composer install --no-dev --no-scripts --no-autoloader --no-interaction --prefer-dist
+
+COPY . .
+COPY --from=assets /app/public/build public/build
+
+RUN composer dump-autoload --optimize --no-dev \
+    && php artisan package:discover --ansi \
+    && chown -R www-data:www-data storage bootstrap/cache \
+    && chown www-data:www-data /var/www \
+    && chmod +x /usr/local/bin/entrypoint.sh
+
+# Workers and scheduler are off by default so a test deploy cannot run
+# backups in parallel with the old server. Enable in Coolify env.
+ENV PG_BIN_DIR=/usr/lib/postgresql/17/bin \
+    BACKUP_TMP_DIR=/var/www/backup-tmp \
+    RUN_QUEUE=false \
+    RUN_SCHEDULER=false \
+    RUN_MIGRATIONS=false
+
+EXPOSE 80
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["supervisord", "-n", "-c", "/etc/supervisor/supervisord.conf"]
