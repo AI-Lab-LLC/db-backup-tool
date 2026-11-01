@@ -2,11 +2,18 @@
 # queue workers + scheduler in one container (supervisord), PostgreSQL 17
 # client for pg_dump / pg_restore / psql (same major as the DB server).
 # The plain Dockerfile stays the local docker-compose image.
+FROM composer:2.8 AS vendor
+WORKDIR /app
+COPY composer.json composer.lock ./
+RUN composer install --no-dev --no-scripts --no-autoloader --no-interaction --prefer-dist --ignore-platform-reqs
+
 FROM node:22-alpine AS assets
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund
 COPY . .
+# Tailwind also scans vendor pagination views (tailwind.config.js).
+COPY --from=vendor /app/vendor/laravel/framework/src/Illuminate/Pagination/resources/views vendor/laravel/framework/src/Illuminate/Pagination/resources/views
 RUN npm run build
 
 FROM php:8.5-fpm-trixie
