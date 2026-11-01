@@ -57,7 +57,8 @@ return [
             'endpoint' => env('AWS_ENDPOINT', 'https://hel1.your-objectstorage.com'),
             'use_path_style_endpoint' => env('AWS_USE_PATH_STYLE_ENDPOINT', true),
             'throw' => false,
-            'report' => false,
+            // Log the underlying S3 exception when put()/delete() return false.
+            'report' => true,
         ],
 
     ],

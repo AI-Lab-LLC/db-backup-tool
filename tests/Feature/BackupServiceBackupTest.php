@@ -33,7 +33,7 @@ class BackupServiceBackupTest extends TestCase
         parent::setUp();
 
         $this->tmpDir = sys_get_temp_dir() . '/backup_panel_test_' . bin2hex(random_bytes(6));
-        config(['backup.tmp_dir' => $this->tmpDir, 'backup.pg.password' => 's3cr3t-pw']);
+        config(['backup.tmp_dir' => $this->tmpDir, 'backup.pg.password' => 's3cr3t-pw', 'backup.upload_retry_delay' => 0]);
 
         $this->disk = Mockery::mock(FilesystemAdapter::class);
         Storage::set(config('backup.disk', 's3'), $this->disk);
@@ -98,6 +98,7 @@ class BackupServiceBackupTest extends TestCase
 
     public function test_put_returning_false_marks_failed_and_cleans_partial_object(): void
     {
+        config(['backup.upload_attempts' => 1]);
         $service = new FakeProcessBackupService();
 
         $this->expectPut(false);
@@ -109,6 +110,44 @@ class BackupServiceBackupTest extends TestCase
         $this->assertSame('failed', $backup->status);
         $this->assertStringContainsString('put() returned false', $backup->fresh()->error);
         $this->assertNotNull($backup->fresh()->finished_at);
+        $this->assertTmpDirEmpty();
+    }
+
+    public function test_put_failing_on_every_attempt_marks_failed(): void
+    {
+        config(['backup.upload_attempts' => 3]);
+        $service = new FakeProcessBackupService();
+
+        $this->disk->shouldReceive('put')->times(3)->andReturn(false);
+        $this->disk->shouldNotReceive('size');
+        $this->disk->shouldReceive('delete')->once()->andReturn(true);
+
+        $backup = $service->backup('nextdo');
+
+        $this->assertSame('failed', $backup->status);
+        $this->assertStringContainsString('after 3 attempt(s)', $backup->fresh()->error);
+        $this->assertTmpDirEmpty();
+    }
+
+    public function test_put_retry_succeeds_after_transient_failure(): void
+    {
+        config(['backup.upload_attempts' => 3]);
+        $service = new FakeProcessBackupService();
+
+        $calls = 0;
+        $this->disk->shouldReceive('put')->twice()->andReturnUsing(function ($path, $stream) use (&$calls) {
+            $calls++;
+            $this->uploaded = is_resource($stream) ? stream_get_contents($stream) : (string) $stream;
+
+            return $calls >= 2;
+        });
+        $this->disk->shouldReceive('size')->once()->andReturnUsing(fn () => strlen($this->uploaded));
+        $this->disk->shouldNotReceive('delete');
+
+        $backup = $service->backup('nextdo');
+
+        $this->assertSame('success', $backup->status);
+        $this->assertSame(strlen($this->uploaded), $backup->fresh()->size_bytes);
         $this->assertTmpDirEmpty();
     }
 

@@ -54,6 +54,20 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | S3 upload retries
+    |--------------------------------------------------------------------------
+    |
+    | Attempts per dump upload and the base pause between them (seconds,
+    | multiplied by the attempt number: 10 s, 20 s, ...).
+    |
+    */
+
+    'upload_attempts' => env('BACKUP_UPLOAD_ATTEMPTS', 3),
+
+    'upload_retry_delay' => env('BACKUP_UPLOAD_RETRY_DELAY', 10),
+
+    /*
+    |--------------------------------------------------------------------------
     | Temp directory for dumps / restores
     |--------------------------------------------------------------------------
     |

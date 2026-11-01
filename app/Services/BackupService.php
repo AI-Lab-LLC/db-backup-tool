@@ -151,25 +151,50 @@ class BackupService
             }
 
             // Stream the dump to S3 (avoids loading the whole file into memory).
-            $stream = fopen($tmpFile, 'rb');
-            if ($stream === false) {
-                return $this->markFailed($backup, "Could not open dump file for upload: {$tmpFile}");
-            }
+            // Hetzner Object Storage occasionally fails a PUT (~1% of runs, on
+            // the larger dumps); a retry a few seconds later goes through, so
+            // retry before giving up. The real S3 error is logged by the disk
+            // ('report' => true in config/filesystems.php).
+            $attempts = max(1, (int) config('backup.upload_attempts', 3));
+            $delay = max(0, (int) config('backup.upload_retry_delay', 10));
+            $uploaded = false;
 
-            $uploadAttempted = true;
+            for ($attempt = 1; $attempt <= $attempts; $attempt++) {
+                $stream = fopen($tmpFile, 'rb');
+                if ($stream === false) {
+                    return $this->markFailed($backup, "Could not open dump file for upload: {$tmpFile}");
+                }
 
-            try {
-                $uploaded = $this->disk()->put($s3Path, $stream);
-            } finally {
-                if (is_resource($stream)) {
-                    fclose($stream);
+                $uploadAttempted = true;
+
+                try {
+                    $uploaded = $this->disk()->put($s3Path, $stream);
+                } finally {
+                    if (is_resource($stream)) {
+                        fclose($stream);
+                    }
+                }
+
+                if ($uploaded !== false) {
+                    break;
+                }
+
+                if ($attempt < $attempts) {
+                    Log::warning('Backup: S3 upload failed, retrying', [
+                        'backup_id' => $backup->id,
+                        's3_path' => $s3Path,
+                        'attempt' => $attempt,
+                    ]);
+                    if ($delay > 0) {
+                        sleep($delay * $attempt);
+                    }
                 }
             }
 
             if ($uploaded === false) {
                 $this->deleteObjectQuietly($s3Path);
 
-                return $this->markFailed($backup, "S3 upload failed: put() returned false for {$s3Path}");
+                return $this->markFailed($backup, "S3 upload failed: put() returned false for {$s3Path} after {$attempts} attempt(s)");
             }
 
             try {
